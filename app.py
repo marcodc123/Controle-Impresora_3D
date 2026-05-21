@@ -1,20 +1,36 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from supabase import create_client, Client
+import gspread
 
 # Configuração da página
 st.set_page_config(page_title="Controle 3D", layout="wide")
 
-# Conexão segura com o Banco de Dados Permanente (Supabase)
-# O Streamlit vai puxar os dados das "Secrets" que vamos configurar no próximo passo
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Conexão com o Google Sheets usando gspread via link público de edição
+try:
+    gc = gspread.public_link(st.secrets["GSHEET_URL"])
+    sheet_estoque = gc.worksheet("estoque")
+    sheet_producao = gc.worksheet("producao")
+except Exception as e:
+    st.error("Erro ao conectar com a Planilha Google. Verifique se o link nas Secrets está correto e se a planilha está compartilhada como 'Editor' para 'Qualquer pessoa com o link'.")
+    st.stop()
 
-st.title("🖨️ Sistema de Produção e Estoque 3D (Dados Salvos)")
+st.title("🖨️ Sistema de Produção e Estoque 3D (Google Sheets)")
 
 aba1, aba2, aba3 = st.tabs(["📋 Nova Produção", "📦 Estoque", "📊 Dashboard"])
+
+# Funções auxiliares para ler dados
+def ler_estoque():
+    dados = sheet_estoque.get_all_values()
+    if not dados:
+        return pd.DataFrame(columns=["ID", "Marca", "Tipo", "Cor", "Preco_Por_Grama", "Gramas"])
+    return pd.DataFrame(dados[1:], columns=dados[0])
+
+def ler_producao():
+    dados = sheet_producao.get_all_values()
+    if not dados:
+        return pd.DataFrame(columns=["ID", "Peca", "Material", "Qtd", "Tempo", "Gramas_Usadas", "Custo"])
+    return pd.DataFrame(dados[1:], columns=dados[0])
 
 with aba2:
     st.subheader("Cadastrar / Abastecer Rolo de Filamento")
@@ -28,91 +44,105 @@ with aba2:
         if st.form_submit_button("Salvar no Estoque"):
             if marca and cor:
                 preco_por_grama_novo = preco_rolo / gramas_rolo if gramas_rolo > 0 else 0
+                df_est = ler_estoque()
                 
-                # Busca no Supabase se já existe material igual
-                resposta = supabase.table("estoque").select("*").eq("marca", marca).eq("tipo", tipo).eq("cor", cor).execute()
-                registro_existente = resposta.data
+                # Se a planilha estiver vazia, cria o cabeçalho
+                if df_est.empty:
+                    sheet_estoque.append_row(["ID", "Marca", "Tipo", "Cor", "Preco_Por_Grama", "Gramas"])
+                    df_est = ler_estoque()
+
+                # Verifica duplicado
+                filtro = (df_est["Marca"] == marca) & (df_est["Tipo"] == tipo) & (df_est["Cor"] == cor)
                 
-                if registro_existente:
-                    id_existente = registro_existente[0]["id"]
-                    gramas_atuais = float(registro_existente[0]["gramas"])
-                    preco_atual = float(registro_existente[0]["preco_por_grama"])
+                if not df_est.empty and filtro.any():
+                    idx_linha = df_est[filtro].index[0] + 2 # +2 por causa do cabeçalho e índice 0
+                    gramas_atuais = float(df_est.loc[df_est[filtro].index[0], "Gramas"])
+                    preco_atual = float(df_est.loc[df_est[filtro].index[0], "Preco_Por_Grama"])
                     
                     novas_gramas_totais = gramas_atuais + gramas_rolo
-                    novo_preco_medio = ((gramas_atuais * preco_atual) + (preco_rolo)) / novas_gramas_totais
+                    novo_preco_medio = ((gramas_atuais * preco_atual) + preco_rolo) / novas_gramas_totais
                     
-                    supabase.table("estoque").update({"gramas": novas_gramas_totais, "preco_por_grama": novo_preco_medio}).eq("id", id_existente).execute()
-                    st.success(f"Estoque atualizado de forma permanente! Adicionadas {gramas_rolo}g.")
+                    sheet_estoque.update_cell(idx_linha, 5, str(novo_preco_medio))
+                    sheet_estoque.update_cell(idx_linha, 6, str(novas_gramas_totais))
+                    st.success(f"Estoque atualizado! Adicionadas {gramas_rolo}g ao filamento existente.")
                 else:
-                    supabase.table("estoque").insert({"marca": marca, "tipo": tipo, "cor": cor, "preco_por_grama": preco_por_grama_novo, "gramas": gramas_rolo}).execute()
-                    st.success("Novo material salvo de forma permanente!")
+                    novo_id = len(df_est) + 1
+                    sheet_estoque.append_row([str(novo_id), marca, tipo, cor, str(preco_por_grama_novo), str(gramas_rolo)])
+                    st.success("Novo material salvo com sucesso!")
             else:
-                st.error("Por favor, preencha a Marca e a Cor.")
+                st.error("Preencha a Marca e a Cor.")
 
     st.subheader("Materiais Disponíveis em Estoque")
-    dados_est = supabase.table("estoque").select("id, marca, tipo, cor, gramas").execute().data
-    if dados_est:
-        df_est = pd.DataFrame(dados_est)
-        df_est.columns = ["ID", "Marca", "Tipo", "Cor", "Gramas Disponíveis"]
-        st.dataframe(df_est, use_container_width=True)
-    else:
-        st.info("Nenhum material em estoque.")
+    df_visualizar_est = ler_estoque()
+    if not df_visualizar_est.empty:
+        st.dataframe(df_visualizar_est, use_container_width=True)
 
 with aba1:
     st.subheader("Registrar Peça Produzida")
-    dados_combo = supabase.table("estoque").select("id, marca, tipo, cor, preco_por_grama, gramas").gt("gramas", 0).execute().data
+    df_combo = ler_estoque()
     
-    if not dados_combo:
+    if df_combo.empty:
         st.warning("Cadastre um filamento na aba 'Estoque' primeiro.")
     else:
-        # Monta a lista visual de seleção
-        opcoes = [f"{item['marca']} - {item['tipo']} ({item['cor']})" for item in dados_combo]
+        df_combo["Gramas"] = df_combo["Gramas"].astype(float)
+        df_disponivel = df_combo[df_combo["Gramas"] > 0]
+        opcoes = [f"{r['Marca']} - {r['Tipo']} ({r['Cor']})" for _, r in df_disponivel.iterrows()]
         
-        with st.form("form_producao"):
-            nome_peca = st.text_input("Nome da Peça")
-            mat_selecionado = st.selectbox("Selecione o Material Utilizado", opciones)
-            qtd = st.number_input("Quantidade de Peças", min_value=1, value=1)
-            tempo = st.number_input("Tempo de Impressão por Peça (Horas)", min_value=0.1, value=2.0)
-            gramas_peca = st.number_input("Gramas de Filamento por Peça (g)", min_value=0.1, value=30.0)
-            custo_hora = st.number_input("Custo de Depreciação/Energia por Hora (R$)", min_value=0.0, value=2.0)
-            
-            if st.form_submit_button("Calcular e Registrar Produção"):
-                idx = opciones.index(mat_selecionado)
-                item_sel = dados_combo[idx]
+        if not opcoes:
+            st.warning("Não há materiais com estoque disponível.")
+        else:
+            with st.form("form_producao"):
+                nome_peca = st.text_input("Nome da Peça")
+                mat_selecionado = st.selectbox("Selecione o Material Utilizado", opcoes)
+                qtd = st.number_input("Quantidade de Peças", min_value=1, value=1)
+                tempo = st.number_input("Tempo de Impressão por Peça (Horas)", min_value=0.1, value=2.0)
+                gramas_peca = st.number_input("Gramas de Filamento por Peça (g)", min_value=0.1, value=30.0)
+                custo_hora = st.number_input("Custo da Máquina por Hora (R$)", min_value=0.0, value=2.0)
                 
-                custo_material = gramas_peca * float(item_sel["preco_por_grama"])
-                custo_maquina = tempo * custo_hora
-                custo_total_peca = custo_material + custo_maquina
-                custo_total_ordem = custo_total_peca * qtd
-                total_gramas_gastas = gramas_peca * qtd
-                
-                if total_gramas_gastas > float(item_sel["gramas"]):
-                    st.error(f"Estoque insuficiente! Precisa de {total_gramas_gastas}g e tem {item_sel['gramas']}g.")
-                else:
-                    # Atualiza o estoque e insere a produção no Supabase
-                    novas_gramas = float(item_sel["gramas"]) - total_gramas_gastas
-                    supabase.table("estoque").update({"gramas": novas_gramas}).eq("id", item_sel["id"]).execute()
+                if st.form_submit_button("Calcular e Registrar Produção"):
+                    idx = opcoes.index(mat_selecionado)
+                    item_sel = df_disponivel.iloc[idx]
                     
-                    supabase.table("producao").insert({
-                        "peca": nome_peca, "material": mat_selecionado, "qtd": qtd,
-                        "tempo": tempo, "gramas_usadas": total_gramas_gastas, "custo": custo_total_ordem
-                    }).execute()
+                    custo_material = gramas_peca * float(item_sel["Preco_Por_Grama"])
+                    custo_maquina = tempo * custo_hora
+                    custo_total_peca = custo_material + custo_maquina
+                    custo_total_ordem = custo_total_peca * qtd
+                    total_gramas_gastas = gramas_peca * qtd
                     
-                    st.success(f"Registrado permanentemente! Custo Total: R$ {custo_total_ordem:.2f}")
+                    if total_gramas_gastas > float(item_sel["Gramas"]):
+                        st.error(f"Estoque insuficiente! Precisa de {total_gramas_gastas}g e tem {item_sel['Gramas']}g.")
+                    else:
+                        # Atualiza estoque na planilha
+                        idx_linha_est = int(item_sel.name) + 2
+                        novas_gramas = float(item_sel["Gramas"]) - total_gramas_gastas
+                        sheet_estoque.update_cell(idx_linha_est, 6, str(novas_gramas))
+                        
+                        # Salva produção
+                        df_prod_atual = ler_producao()
+                        if df_prod_atual.empty:
+                            sheet_producao.append_row(["ID", "Peca", "Material", "Qtd", "Tempo", "Gramas_Usadas", "Custo"])
+                            df_prod_atual = ler_producao()
+                        
+                        novo_id_prod = len(df_prod_atual) + 1
+                        sheet_producao.append_row([str(novo_id_prod), nome_peca, mat_selecionado, str(qtd), str(tempo), str(total_gramas_gastas), str(custo_total_ordem)])
+                        st.success(f"Registrado com sucesso! Custo Total: R$ {custo_total_ordem:.2f}")
 
 with aba3:
     st.subheader("Indicadores de Desempenho")
-    dados_prod = supabase.table("producao").select("*").execute().data
-    if dados_prod:
-        df_prod = pd.DataFrame(dados_prod)
+    df_prod_grafico = ler_producao()
+    if not df_prod_grafico.empty and len(df_prod_grafico) > 0:
+        df_prod_grafico["Custo"] = df_prod_grafico["Custo"].astype(float)
+        df_prod_grafico["Qtd"] = df_prod_grafico["Qtd"].astype(int)
+        df_prod_grafico["Gramas_Usadas"] = df_prod_grafico["Gramas_Usadas"].astype(float)
+        
         col1, col2 = st.columns(2)
         with col1:
-            st.metric("Custo Total Acumulado", f"R$ {df_prod['custo'].sum():.2f}")
-            fig = px.bar(df_prod, x="peca", y="custo", title="Custo por Peça")
+            st.metric("Custo Total Acumulado", f"R$ {df_prod_grafico['Custo'].sum():.2f}")
+            fig = px.bar(df_prod_grafico, x="Peca", y="Custo", title="Custo por Peça")
             st.plotly_chart(fig, use_container_width=True)
         with col2:
-            st.metric("Total de Peças Impressas", int(df_prod['qtd'].sum()))
-            fig2 = px.pie(df_prod, names="material", values="gramas_usadas", title="Consumo de Filamento (g)")
+            st.metric("Total de Peças Impressas", int(df_prod_grafico['Qtd'].sum()))
+            fig2 = px.pie(df_prod_grafico, names="Material", values="Gramas_Usadas", title="Consumo de Filamento (g)")
             st.plotly_chart(fig2, use_container_width=True)
     else:
         st.info("Nenhuma produção registrada para gerar gráficos.")
