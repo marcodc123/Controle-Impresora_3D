@@ -5,7 +5,7 @@ import plotly.express as px
 
 # Configuração da página e conexão com Banco de Dados SQLite
 st.set_page_config(page_title="Controle 3D", layout="wide")
-conn = sqlite3.connect("producao_3d.db", check_same_thread=False)
+conn = sqlite3.connect("", check_same_thread=False)
 cursor = conn.cursor()
 
 # Criar tabelas se não existirem (estoque agora armazena gramas)
